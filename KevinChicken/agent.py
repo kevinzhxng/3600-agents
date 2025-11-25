@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from typing import List, Set, Tuple
 import numpy as np
+import time, random
 from game import *
 
 """
@@ -32,6 +33,18 @@ class PlayerAgent:
         # If only one move available, return it immediately (no need to search)
         if len(moves) == 1:
             return moves[0]
+
+        # Endgame hybrid trigger: switch to MCTS when few turns left or tight score.
+        if self.should_use_mcts(board, moves, time_left()):
+            # Allocate small slice of time for MCTS (max 1s or 5% of remaining time)
+            mcts_time = min(1.0, max(0.25, time_left() * 0.05))
+            try:
+                mcts_move = self.mcts_endgame(board, time_left, mcts_time)
+                if mcts_move is not None:
+                    print(f"MCTS chose {mcts_move} in {mcts_time:.2f}s")
+                    return mcts_move
+            except Exception as e:
+                print(f"MCTS fallback due to error: {e}")
         
         # Adaptive time management: allocate time based on game phase and remaining time
         remaining = time_left()
@@ -166,6 +179,147 @@ class PlayerAgent:
                 break  # Beta cutoff
         
         return max_eval
+
+    # ----------------- HYBRID MCTS HELPERS -----------------
+    class _Node:
+        __slots__ = ("board", "move", "parent", "children", "wins", "visits", "unexpanded")
+        def __init__(self, board, move=None, parent=None, children=None):
+            self.board = board
+            self.move = move
+            self.parent = parent
+            self.children = [] if children is None else children
+            self.wins = 0.0
+            self.visits = 0
+            # Track moves not yet expanded (ordered for policy guidance)
+            self.unexpanded = []
+
+    def should_use_mcts(self, board: board.Board, moves, remaining_time: float) -> bool:
+        """Decide if we switch to MCTS for endgame.
+        Heuristics:
+        - Few moves (<=4) OR many eggs laid (>=30 total) OR time is low (<120s)
+        - Egg gap small (<=3)
+        """
+        player_eggs = board.chicken_player.get_eggs_laid()
+        enemy_eggs = board.chicken_enemy.get_eggs_laid()
+        egg_gap = abs(player_eggs - enemy_eggs)
+        total_eggs = player_eggs + enemy_eggs
+        return (len(moves) <= 4 or total_eggs >= 30 or remaining_time < 120) and egg_gap <= 3
+
+    def mcts_endgame(self, board: board.Board, time_left: Callable, max_time: float):
+        """Run a lightweight MCTS from the current position for up to max_time seconds.
+        Returns best move found or None.
+        """
+        start = time.time()
+        end_time = start + max_time
+
+        # Root node setup
+        root = self._Node(board)
+        moves = board.get_valid_moves()
+        ordered = self.order_moves_advanced(board, moves)
+        root.unexpanded = list(ordered)
+
+        if not ordered:
+            return None
+
+        # Pre-expand one child to seed tree
+        self._expand_node(root)
+
+        # Main loop
+        iterations = 0
+        while time.time() < end_time:
+            iterations += 1
+            path = [root]
+            node = root
+            # Selection: descend using UCT while node fully expanded and has children
+            while node.unexpanded == [] and node.children:
+                node = self._select_child(node)
+                path.append(node)
+
+            # Expansion (if possible)
+            if node.unexpanded and time.time() < end_time:
+                node = self._expand_node(node)
+                path.append(node)
+
+            # Simulation / rollout
+            result = self._rollout(node.board, end_time)
+
+            # Backpropagation
+            for n in path:
+                n.visits += 1
+                n.wins += result
+
+        # Choose move with highest visits (robust) from root
+        best = None
+        best_visits = -1
+        for child in root.children:
+            if child.visits > best_visits:
+                best_visits = child.visits
+                best = child.move
+
+        return best
+
+    def _expand_node(self, node: '_Node'):
+        move = node.unexpanded.pop(0)
+        direction, move_type = move
+        new_board = node.board.forecast_move(direction, move_type)
+        if new_board is None:
+            # Skip invalid forecast and try next if exists
+            return node if not node.unexpanded else self._expand_node(node)
+        new_board.reverse_perspective()
+        child = self._Node(new_board, move=move, parent=node)
+        # Order child move list for later expansion
+        child_moves = new_board.get_valid_moves()
+        child.unexpanded = list(self.order_moves_advanced(new_board, child_moves))
+        node.children.append(child)
+        return child
+
+    def _select_child(self, node: '_Node'):
+        # UCT selection
+        parent_visits = max(1, node.visits)
+        C = 0.5  # exploration constant tuned low for deterministic game
+        best_score = -1e9
+        best_child = None
+        for c in node.children:
+            if c.visits == 0:
+                return c
+            mean = c.wins / c.visits
+            uct = mean + C * np.sqrt(np.log(parent_visits) / c.visits)
+            if uct > best_score:
+                best_score = uct
+                best_child = c
+        return best_child
+
+    def _rollout(self, board: board.Board, end_time: float, depth_limit: int = 12):
+        depth = 0
+        while depth < depth_limit and not board.is_game_over() and time.time() < end_time:
+            moves = board.get_valid_moves()
+            if not moves:
+                break
+            ordered = self.order_moves_advanced(board, moves)
+            # Bias: choose among top 3 ordered moves randomly
+            slice_moves = ordered[:3] if len(ordered) >= 3 else ordered
+            direction, move_type = random.choice(slice_moves)
+            new_board = board.forecast_move(direction, move_type)
+            if new_board is None:
+                break
+            new_board.reverse_perspective()
+            board = new_board
+            depth += 1
+
+        # Terminal check
+        if board.is_game_over():
+            winner = board.get_winner()
+            if winner == enums.Result.PLAYER:
+                return 1.0
+            elif winner == enums.Result.ENEMY:
+                return 0.0
+            else:
+                return 0.5
+
+        # Fallback heuristic scaling to [0,1]
+        heuristic = self.evaluate_board(board)
+        # Compress large range using tanh
+        return 0.5 + 0.5 * np.tanh(heuristic / 2000.0)
 
     def order_moves_advanced(self, board: board.Board, moves):
         """
